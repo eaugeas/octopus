@@ -101,34 +101,6 @@ func TestPoolRunErrTimeout(t *testing.T) {
 	}
 }
 
-func TestPoolRunErrCancel(t *testing.T) {
-	resC := make(chan PoolResult, 10)
-	ctx, cancel := context.WithCancel(context.Background())
-	pool := NewPoolRunnerWithOpts(ctx, PoolOpts{
-		Concurrency: 1,
-	})
-
-	for i := 0; i < 10; i++ {
-		value := i
-		pool.Run(PoolInput{
-			Supplier: SupplierFunc(func() (interface{}, error) {
-				return value, nil
-			}),
-			OutC: resC,
-		})
-
-		if i == 1 {
-			cancel()
-		}
-	}
-
-	pool.Stop()
-	close(resC)
-	counter := 0
-
-	assert.True(t, counter < 10)
-}
-
 func runPoolBenchmark(b *testing.B, s Supplier) {
 	outC := make(chan PoolResult, 64)
 	pool := NewPoolRunnerWithOpts(context.TODO(), PoolOpts{

@@ -3,7 +3,7 @@ package interval
 import (
 	"math"
 
-	"github.com/tlblanc/octopus/container/tree"
+	"github.com/eaugeas/octopus/container/tree"
 )
 
 // IntLesser is an implementor of tree.Lesser that
@@ -58,7 +58,7 @@ func (i Int) Len() int {
 
 // Contains returns true if the interval represented
 // by j is contained by i
-func (i *Int) Contains(j Int) bool {
+func (i Int) Contains(j Int) bool {
 	return i.min <= j.min && j.max <= i.max
 }
 

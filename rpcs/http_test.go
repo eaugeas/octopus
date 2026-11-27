@@ -201,9 +201,11 @@ func TestHttpRouteReportSuccessEncoderErr(t *testing.T) {
 	req, _ := http.NewRequest("GET", "/path", nil)
 	status, err := route.reportSuccess(recorder, req, make(map[string]string))
 
+	// the status returned is the one written to the response
 	assert.Error(t, err)
-	assert.Equal(t, 0, status)
+	assert.Equal(t, http.StatusInternalServerError, status)
 	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+	assert.Equal(t, "", recorder.Body.String())
 }
 
 func TestHttpBinderBuildRouter(t *testing.T) {
@@ -378,4 +380,334 @@ func TestHttpCorsPreProcessorErrMethodNotAllowed(t *testing.T) {
 	ok, _ := processor.ServeHTTP(recorder, req)
 
 	assert.False(t, ok)
+}
+
+type ctxKey string
+
+// HttpPreProcessorWithValue replaces the request with one that carries
+// a value in its context
+type HttpPreProcessorWithValue struct{}
+
+func (p HttpPreProcessorWithValue) ServeHTTP(w http.ResponseWriter, req *http.Request) (HttpPreProcessorResult, error) {
+	return HttpPreProcessorResult{
+		Request:  req.WithContext(context.WithValue(req.Context(), ctxKey("key"), "value")),
+		Continue: true,
+	}, nil
+}
+
+// HttpPreProcessorStop handles the request itself
+type HttpPreProcessorStop struct{}
+
+func (p HttpPreProcessorStop) ServeHTTP(w http.ResponseWriter, req *http.Request) (HttpPreProcessorResult, error) {
+	w.WriteHeader(http.StatusTeapot)
+	return HttpPreProcessorResult{Continue: false}, nil
+}
+
+func TestHttpRoutePreProcessorModifiedRequestIsUsed(t *testing.T) {
+	route := NewHttpRoute(HttpRouteProps{
+		Logger:  logger,
+		Encoder: JsonEncoder{},
+		Handlers: MethodHandlers{
+			"GET": HttpMiddlewareFunc(func(req *http.Request) (interface{}, error) {
+				return map[string]interface{}{"key": req.Context().Value(ctxKey("key"))}, nil
+			}),
+		},
+		PreProcessors: []HttpPreProcessor{HttpPreProcessorWithValue{}},
+	})
+
+	recorder := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/path", nil)
+	route.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, "{\"key\":\"value\"}\n", recorder.Body.String())
+}
+
+func TestHttpRoutePreProcessorStops(t *testing.T) {
+	called := false
+	route := NewHttpRoute(HttpRouteProps{
+		Logger:  logger,
+		Encoder: JsonEncoder{},
+		Handlers: MethodHandlers{
+			"GET": HttpMiddlewareFunc(func(req *http.Request) (interface{}, error) {
+				called = true
+				return nil, nil
+			}),
+		},
+		PreProcessors: []HttpPreProcessor{HttpPreProcessorStop{}},
+	})
+
+	recorder := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/path", nil)
+	route.ServeHTTP(recorder, req)
+
+	assert.False(t, called)
+	assert.Equal(t, http.StatusTeapot, recorder.Code)
+}
+
+func TestHttpErrorWithoutCause(t *testing.T) {
+	err := &HttpError{StatusCode: http.StatusNotFound}
+	assert.Equal(t, "Not Found with status code 404", err.Error())
+
+	err = HttpMethodNotAllowed(context.Background(), nil)
+	assert.Equal(t, "Method Not Allowed with status code 405", err.Error())
+
+	err = HttpBadRequest(context.Background(), stderr.New("bad input"))
+	assert.Equal(t, "bad input with status code 400", err.Error())
+}
+
+func newJsonRequest(contentType, body string) *http.Request {
+	req := httptest.NewRequest("POST", "/path", bytes.NewBufferString(body))
+	if len(contentType) > 0 {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return req
+}
+
+func TestHttpJsonHandlerContentTypeWithParameters(t *testing.T) {
+	handler := NewHttpJsonHandler(HttpJsonHandlerProperties{
+		Limit:   1024,
+		Handler: HandlerEcho{},
+		Logger:  logger,
+		Factory: mapEntityFactory(),
+	})
+
+	for _, contentType := range []string{
+		"application/json",
+		"application/json; charset=utf-8",
+		"Application/JSON;charset=UTF-8",
+	} {
+		v, err := handler.ServeHTTP(newJsonRequest(contentType, `{"potato":"fried"}`))
+		assert.Nil(t, err, contentType)
+		if assert.NotNil(t, v, contentType) {
+			assert.Equal(t, map[string]string{"potato": "fried"}, *v.(*map[string]string))
+		}
+	}
+}
+
+func TestHttpJsonHandlerContentTypeRejected(t *testing.T) {
+	handler := NewHttpJsonHandler(HttpJsonHandlerProperties{
+		Limit:   1024,
+		Handler: HandlerEcho{},
+		Logger:  logger,
+		Factory: mapEntityFactory(),
+	})
+
+	for _, contentType := range []string{
+		"",
+		"text/plain",
+		"text/plain; charset=utf-8",
+		"application/jsonp",
+		"application/json-patch+json",
+		"application/json; charset", // malformed parameter
+	} {
+		v, err := handler.ServeHTTP(newJsonRequest(contentType, `{"potato":"fried"}`))
+		assert.Nil(t, v, contentType)
+		if httpErr, ok := err.(*HttpError); assert.True(t, ok, contentType) {
+			assert.Equal(t, ErrHttpContentTypeNotJSON, httpErr.Cause, contentType)
+			assert.Equal(t, http.StatusBadRequest, httpErr.StatusCode, contentType)
+		}
+	}
+}
+
+func setupRouteRouter(handlers MethodHandlers, preProcessors ...HttpPreProcessor) *HttpRouter {
+	enc := JsonEncoder{}
+	return &HttpRouter{
+		encoder: enc,
+		logger:  logger,
+		mux: map[string]*HttpRoute{
+			"/path": NewHttpRoute(HttpRouteProps{
+				Logger:        logger,
+				Encoder:       enc,
+				Handlers:      handlers,
+				PreProcessors: preProcessors,
+			}),
+		},
+	}
+}
+
+func TestHttpRouterServeHTTPUnencodableBody(t *testing.T) {
+	for _, body := range []interface{}{
+		make(chan int),
+		map[string]interface{}{"ok": 1, "fail": make(chan int)},
+	} {
+		router := setupRouteRouter(MethodHandlers{"GET": HttpMiddlewareOK{body: body}})
+
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/path", nil)
+		router.ServeHTTP(recorder, req)
+
+		// a clean error response, without any partially encoded body
+		assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+		assert.Equal(t, "{\"errorCode\":-1,\"description\":\"Internal Server Error\"}\n", recorder.Body.String())
+		// the trace ID is set once, not once per attempt to write a response
+		assert.Len(t, recorder.Header().Values(HttpHeaderTraceID), 1)
+	}
+}
+
+func TestHttpRouteReportSuccessUnencodable(t *testing.T) {
+	route := NewHttpRoute(HttpRouteProps{Logger: logger, Encoder: JsonEncoder{}})
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/path", nil)
+	status, err := route.reportSuccess(recorder, req, make(chan int))
+
+	assert.Error(t, err)
+	assert.Equal(t, http.StatusInternalServerError, status)
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+}
+
+func TestHttpRouteReportErrorEncoderErr(t *testing.T) {
+	route := NewHttpRoute(HttpRouteProps{Logger: logger, Encoder: ErrEncoder{}})
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/path", nil)
+	httpErr := HttpBadRequest(req.Context(), stderr.New("bad input"))
+	status, err := route.reportError(recorder, req, httpErr)
+
+	// the encoding error is returned, not the error being reported
+	assert.Error(t, err)
+	assert.Equal(t, "failed to encode", err.Error())
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, http.StatusBadRequest, recorder.Code)
+	assert.Equal(t, "", recorder.Body.String())
+}
+
+func TestHttpRouteReportErrorOK(t *testing.T) {
+	route := NewHttpRoute(HttpRouteProps{Logger: logger, Encoder: JsonEncoder{}})
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/path", nil)
+	status, err := route.reportError(recorder, req, HttpBadRequest(req.Context(), stderr.New("bad input")))
+
+	assert.Nil(t, err)
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, http.StatusBadRequest, recorder.Code)
+	assert.Equal(t, "{\"errorCode\":-1,\"description\":\"Bad Request\"}\n", recorder.Body.String())
+}
+
+func TestHttpRouterServeHTTPErrorEncoderErr(t *testing.T) {
+	router := setupRouter()
+	router.encoder = ErrEncoder{}
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/panic", nil)
+	router.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+	assert.Equal(t, "", recorder.Body.String())
+}
+
+// HttpPreProcessorWriteThenPanic starts a response and then panics
+type HttpPreProcessorWriteThenPanic struct{}
+
+func (p HttpPreProcessorWriteThenPanic) ServeHTTP(w http.ResponseWriter, req *http.Request) (HttpPreProcessorResult, error) {
+	w.WriteHeader(http.StatusAccepted)
+	_, _ = w.Write([]byte("partial"))
+	panic("error")
+}
+
+func TestHttpRouterServeHTTPPanicAfterWrite(t *testing.T) {
+	router := setupRouteRouter(
+		MethodHandlers{"GET": HttpMiddlewareOK{body: nil}},
+		HttpPreProcessorWriteThenPanic{})
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/path", nil)
+	router.ServeHTTP(recorder, req)
+
+	// the response that was already started is left untouched
+	assert.Equal(t, http.StatusAccepted, recorder.Code)
+	assert.Equal(t, "partial", recorder.Body.String())
+}
+
+func TestHttpRouterServeHTTPPanicBeforeWrite(t *testing.T) {
+	router := setupRouteRouter(MethodHandlers{"GET": HttpMiddlewarePanic{}})
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/path", nil)
+	router.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusInternalServerError, recorder.Code)
+	assert.Equal(t, "{\"errorCode\":-1,\"description\":\"Internal Server Error\"}\n", recorder.Body.String())
+}
+
+func TestTrackingResponseWriterFlush(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	w := &trackingResponseWriter{ResponseWriter: recorder}
+
+	w.Flush()
+	assert.True(t, w.wroteHeader)
+	assert.True(t, recorder.Flushed)
+	assert.Equal(t, http.ResponseWriter(recorder), w.Unwrap())
+}
+
+func TestHttpCorsPreProcessorAsPreProcessor(t *testing.T) {
+	called := 0
+	binder := NewHttpBinder(HttpBinderProperties{
+		Encoder: JsonEncoder{},
+		Logger:  logger,
+		HandlerFactory: HttpHandlerFactoryFunc(func(factory EntityFactory, handler Handler) HttpMiddleware {
+			return HttpMiddlewareFunc(func(req *http.Request) (interface{}, error) {
+				called++
+				return map[string]string{"result": "ok"}, nil
+			})
+		}),
+	})
+	binder.AddPreProcessor(NewHttpCorsPreProcessor(HttpCorsPreProcessorProps{
+		Enabled:        true,
+		AllowedOrigins: []string{"http://app.example"},
+		AllowedMethods: []string{http.MethodPost},
+		MaxAge:         60,
+	}).AsPreProcessor())
+	binder.Bind(http.MethodPost, "/path", HandlerEcho{}, nil)
+	router := binder.Build()
+
+	// preflight requests are answered by the pre processor
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodOptions, "/path", nil)
+	req.Header.Set("Origin", "http://app.example")
+	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	router.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusNoContent, recorder.Code)
+	assert.Equal(t, "http://app.example", recorder.Header().Get("Access-Control-Allow-Origin"))
+	assert.Equal(t, "POST", recorder.Header().Get("Access-Control-Allow-Methods"))
+	assert.Equal(t, "60", recorder.Header().Get("Access-Control-Max-Age"))
+	assert.Equal(t, 0, called)
+
+	// actual requests go through to the handler with the CORS headers
+	recorder = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/path", nil)
+	req.Header.Set("Origin", "http://app.example")
+	router.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, "http://app.example", recorder.Header().Get("Access-Control-Allow-Origin"))
+	assert.Equal(t, "{\"result\":\"ok\"}\n", recorder.Body.String())
+	assert.Equal(t, 1, called)
+
+	// requests from other origins are not given CORS headers
+	recorder = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/path", nil)
+	req.Header.Set("Origin", "http://other.example")
+	router.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, "", recorder.Header().Get("Access-Control-Allow-Origin"))
+	assert.Equal(t, 2, called)
+}
+
+func TestHttpCorsPreProcessorAsPreProcessorDisabled(t *testing.T) {
+	processor := NewHttpCorsPreProcessor(HttpCorsPreProcessorProps{Enabled: false}).AsPreProcessor()
+
+	req := httptest.NewRequest(http.MethodOptions, "/path", nil)
+	req.Header.Set("Origin", "http://app.example")
+	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	recorder := httptest.NewRecorder()
+
+	result, err := processor.ServeHTTP(recorder, req)
+	assert.Nil(t, err)
+	assert.True(t, result.Continue)
+	assert.Equal(t, req, result.Request)
 }

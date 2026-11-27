@@ -1,9 +1,11 @@
 package rpcs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"mime"
 	"net/http"
 	"runtime/debug"
 	"strconv"
@@ -78,6 +80,14 @@ func (e *HttpError) Log(fields logs.Fields) {
 
 // Error is the implementation of go's error interface for Error
 func (e *HttpError) Error() string {
+	if e.Cause == nil {
+		msg := e.Message
+		if len(msg) == 0 {
+			msg = http.StatusText(e.StatusCode)
+		}
+		return fmt.Sprintf("%s with status code %d", msg, e.StatusCode)
+	}
+
 	return fmt.Sprintf("%s with status code %d", e.Cause.Error(), e.StatusCode)
 }
 
@@ -180,6 +190,31 @@ func (h *HttpRoute) HasHandler(method string) bool {
 	return ok
 }
 
+// setTraceID sets the trace ID header of the response
+func setTraceID(res http.ResponseWriter, req *http.Request) {
+	res.Header().Set(HttpHeaderTraceID, strconv.FormatInt(logs.GetTraceID(req.Context()), 10))
+}
+
+// encodeErrorBody encodes the body of an error response for err
+func encodeErrorBody(encoder Encoder, err *HttpError) (*bytes.Buffer, error) {
+	code := -1
+	desc := err.Message
+
+	if e, ok := err.Cause.(*errs.Error); ok {
+		code = e.ErrorCode
+	}
+
+	var buf bytes.Buffer
+	if eerr := encoder.Encode(&buf, errs.Error{
+		ErrorCode:   code,
+		Description: desc,
+	}); eerr != nil {
+		return nil, eerr
+	}
+
+	return &buf, nil
+}
+
 func (h *HttpRoute) reportSuccess(
 	res http.ResponseWriter,
 	req *http.Request,
@@ -188,22 +223,31 @@ func (h *HttpRoute) reportSuccess(
 	path := req.URL.EscapedPath()
 	method := req.Method
 
-	res.Header().Add(HttpHeaderTraceID, strconv.FormatInt(logs.GetTraceID(req.Context()), 10))
+	setTraceID(res, req)
 
 	if body == nil {
 		res.WriteHeader(http.StatusNoContent)
 		return http.StatusNoContent, nil
 	}
 
-	if err := h.encoder.Encode(res, body); err != nil {
-		res.WriteHeader(http.StatusInternalServerError)
-		h.logger.Info(req.Context(), "", logs.MapFields{
+	// encode into a buffer first so that an encoding failure can still be
+	// reported with an error status instead of a partially written body
+	var buf bytes.Buffer
+	if err := h.encoder.Encode(&buf, body); err != nil {
+		status, _ := h.reportError(res, req, HttpInternalServerError(req.Context(), err))
+		h.logger.Warn(req.Context(), "failed to encode response to response writer", logs.MapFields{
 			"path":        path,
 			"method":      method,
 			"call_type":   "HttpRequestHandleSuccess",
-			"status_code": http.StatusNoContent,
+			"status_code": status,
+			"err":         err.Error(),
 		})
-		return 0, err
+		return status, err
+	}
+
+	res.WriteHeader(http.StatusOK)
+	if _, err := res.Write(buf.Bytes()); err != nil {
+		return http.StatusOK, err
 	}
 
 	return http.StatusOK, nil
@@ -215,10 +259,11 @@ func (h *HttpRoute) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		"path":   req.URL.Path,
 		"method": req.Method,
 	}))
-	result := HttpPreProcessorResult{Continue: true, Request: req}
-	var err error
+	// next is the request passed on to the next pre processor and
+	// eventually to the handler. Pre processors may replace it
+	next := req
 	for _, preProcessor := range h.preProcessors {
-		result, err = preProcessor.ServeHTTP(res, result.Request)
+		result, err := preProcessor.ServeHTTP(res, next)
 		if err != nil {
 			h.logger.Warn(req.Context(), "error", logs.MapFields(map[string]interface{}{
 				"path":   req.URL.Path,
@@ -231,9 +276,13 @@ func (h *HttpRoute) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 		if !result.Continue {
 			return
 		}
+
+		if result.Request != nil {
+			next = result.Request
+		}
 	}
 
-	status, err := h.serveHTTP(res, req)
+	status, err := h.serveHTTP(res, next)
 	var errMsg = ""
 	if err != nil {
 		errMsg = err.Error()
@@ -298,28 +347,29 @@ func (h *HttpRoute) reportError(res http.ResponseWriter, req *http.Request, err 
 	path := req.URL.EscapedPath()
 	method := req.Method
 
-	res.Header().Add(HttpHeaderTraceID, strconv.FormatInt(logs.GetTraceID(req.Context()), 10))
+	setTraceID(res, req)
+
+	if err.Cause == nil {
+		res.WriteHeader(err.StatusCode)
+		return err.StatusCode, nil
+	}
+
+	body, eerr := encodeErrorBody(h.encoder, err)
+	if eerr != nil {
+		// the status is still written, only without a body
+		res.WriteHeader(err.StatusCode)
+		h.logger.Warn(req.Context(), "failed to encode error response to response writer", logs.MapFields{
+			"path":        path,
+			"method":      method,
+			"call_type":   "HttpEncodeErrorError",
+			"status_code": err.StatusCode,
+		}, &errs.Error{Description: eerr.Error()})
+		return err.StatusCode, eerr
+	}
+
 	res.WriteHeader(err.StatusCode)
-
-	if err.Cause != nil {
-		code := -1
-		desc := err.Message
-
-		if e, ok := err.Cause.(*errs.Error); ok {
-			code = e.ErrorCode
-		}
-
-		if eerr := h.encoder.Encode(res, errs.Error{
-			ErrorCode:   code,
-			Description: desc,
-		}); eerr != nil {
-			h.logger.Warn(req.Context(), "failed to encode error response to response writer", logs.MapFields{
-				"path":      path,
-				"method":    method,
-				"call_type": "HttpEncodeErrorError",
-			}, &errs.Error{Description: eerr.Error()})
-			return 0, err
-		}
+	if _, werr := res.Write(body.Bytes()); werr != nil {
+		return err.StatusCode, werr
 	}
 	return err.StatusCode, nil
 }
@@ -350,12 +400,47 @@ func (h *HttpRouter) HasHandler(path, method string) bool {
 	return route.HasHandler(method)
 }
 
+// trackingResponseWriter keeps track of whether a response has
+// started to be written, so that a recovered panic does not try to
+// write a second status
+type trackingResponseWriter struct {
+	http.ResponseWriter
+	wroteHeader bool
+}
+
+// WriteHeader is the implementation of http.ResponseWriter
+func (w *trackingResponseWriter) WriteHeader(statusCode int) {
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+// Write is the implementation of http.ResponseWriter
+func (w *trackingResponseWriter) Write(b []byte) (int, error) {
+	w.wroteHeader = true
+	return w.ResponseWriter.Write(b)
+}
+
+// Flush is the implementation of http.Flusher. It is a no-op if the
+// wrapped writer does not support flushing
+func (w *trackingResponseWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		w.wroteHeader = true
+		f.Flush()
+	}
+}
+
+// Unwrap returns the wrapped writer, as expected by http.ResponseController
+func (w *trackingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 // HttpRouter implementation of http.Handler
-func (h *HttpRouter) ServeHTTP(res http.ResponseWriter, req *http.Request) {
+func (h *HttpRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	path := req.URL.EscapedPath()
 	method := req.Method
 	traceID := ParseTraceID(req.Header.Get(HttpHeaderTraceID))
 	req = req.WithContext(context.WithValue(req.Context(), logs.ContextKeyTraceID, traceID))
+	res := &trackingResponseWriter{ResponseWriter: w}
 
 	h.logger.Debug(req.Context(), "", logs.MapFields{
 		"path":      path,
@@ -378,12 +463,19 @@ func (h *HttpRouter) ServeHTTP(res http.ResponseWriter, req *http.Request) {
 			}
 
 			h.logger.Warn(req.Context(), "unexpected panic caught", logs.MapFields{
-				"path":       path,
-				"method":     method,
-				"call_type":  "HttpRequestHandleFailure",
-				"err":        err,
-				"stacktrace": string(stacktrace),
+				"path":         path,
+				"method":       method,
+				"call_type":    "HttpRequestHandleFailure",
+				"err":          err,
+				"stacktrace":   string(stacktrace),
+				"wrote_header": res.wroteHeader,
 			})
+
+			// a response that has already been started cannot be replaced
+			if res.wroteHeader {
+				return
+			}
+
 			// the `err` generated above is an internal error that should not
 			// be exposed to the client. Instead, this we just return a generic
 			// error
@@ -414,20 +506,12 @@ func (h *HttpRouter) reportError(res http.ResponseWriter, req *http.Request, err
 	path := req.URL.EscapedPath()
 	method := req.Method
 
-	res.Header().Add(HttpHeaderTraceID, strconv.FormatInt(logs.GetTraceID(req.Context()), 10))
-	res.WriteHeader(err.StatusCode)
+	setTraceID(res, req)
 
 	if err.Cause != nil {
-		code := -1
-		desc := err.Message
-
-		if e, ok := err.Cause.(*errs.Error); ok {
-			code = e.ErrorCode
-		}
-		if eerr := h.encoder.Encode(res, errs.Error{
-			ErrorCode:   code,
-			Description: desc,
-		}); eerr != nil {
+		body, eerr := encodeErrorBody(h.encoder, err)
+		if eerr != nil {
+			res.WriteHeader(err.StatusCode)
 			h.logger.Debug(req.Context(), "failed to encode error response to response writer", logs.MapFields{
 				"path":      path,
 				"method":    method,
@@ -435,6 +519,11 @@ func (h *HttpRouter) reportError(res http.ResponseWriter, req *http.Request, err
 			}, &errs.Error{Description: eerr.Error()})
 			return
 		}
+
+		res.WriteHeader(err.StatusCode)
+		_, _ = res.Write(body.Bytes())
+	} else {
+		res.WriteHeader(err.StatusCode)
 	}
 
 	h.logger.Info(req.Context(), "", logs.MapFields{
@@ -534,6 +623,25 @@ func (h *HttpCorsPreProcessor) ServeHTTP(w http.ResponseWriter, req *http.Reques
 	return next, nextReq
 }
 
+// httpCorsPreProcessorAdapter adapts an HttpCorsPreProcessor to
+// the HttpPreProcessor interface
+type httpCorsPreProcessorAdapter struct {
+	cors *HttpCorsPreProcessor
+}
+
+// ServeHTTP is the implementation of HttpPreProcessor
+func (a httpCorsPreProcessorAdapter) ServeHTTP(w http.ResponseWriter, req *http.Request) (HttpPreProcessorResult, error) {
+	next, nextReq := a.cors.ServeHTTP(w, req)
+	return HttpPreProcessorResult{Request: nextReq, Continue: next}, nil
+}
+
+// AsPreProcessor returns the HttpCorsPreProcessor as an HttpPreProcessor so
+// that it can be added to an HttpBinder with AddPreProcessor. Preflight
+// requests are answered by the pre processor and do not reach the handlers
+func (h *HttpCorsPreProcessor) AsPreProcessor() HttpPreProcessor {
+	return httpCorsPreProcessorAdapter{cors: h}
+}
+
 // HttpJsonHandler handles requests that expect a body in the JSON format,
 // handles the body and executes the final handler with the expected type
 type HttpJsonHandler struct {
@@ -612,10 +720,13 @@ func (h *HttpJsonHandler) ServeHTTP(req *http.Request) (interface{}, error) {
 		return nil, &HttpError{Cause: ErrHttpContentLengthExceeds, StatusCode: http.StatusBadRequest}
 	}
 
-	// verify that content type is set and it is correct
-	contentType := req.Header.Get("Content-type")
-	if req.ContentLength > 0 && contentType != "application/json" {
-		return nil, &HttpError{Cause: ErrHttpContentTypeNotJSON, StatusCode: http.StatusBadRequest}
+	// verify that content type is set and it is correct. Parameters such
+	// as charset are allowed
+	if req.ContentLength > 0 {
+		mediaType, _, err := mime.ParseMediaType(req.Header.Get("Content-type"))
+		if err != nil || mediaType != "application/json" {
+			return nil, &HttpError{Cause: ErrHttpContentTypeNotJSON, StatusCode: http.StatusBadRequest}
+		}
 	}
 
 	// parse body into Go object

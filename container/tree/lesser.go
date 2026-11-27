@@ -14,9 +14,10 @@ type Lesser interface {
 type IntLesser struct{}
 
 // Less returns
-//  -1 if a < b
-//   0 if a == b
-//   1 if a > b
+//
+//	-1 if a < b
+//	 0 if a == b
+//	 1 if a > b
 func (IntLesser) Less(a, b interface{}) int {
 	if a.(int) < b.(int) {
 		return -1

@@ -1,6 +1,22 @@
 package concurrent
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrPoolStopped is returned by PoolRunner.Run when the pool has
+// been stopped and cannot accept more inputs
+var ErrPoolStopped = errors.New("pool runner is stopped")
+
+// ErrMasterStopped is returned by the methods of a Master when its
+// event loop has exited, either because Stop was called or because
+// the context passed to Start is done
+var ErrMasterStopped = errors.New("master is stopped")
+
+// ErrWorkerExited is returned for a request sent to a worker that
+// exited before handling it
+var ErrWorkerExited = errors.New("worker has exited")
 
 // ErrNoOccurrence is returned failing to wait for an
 // event that never occurred

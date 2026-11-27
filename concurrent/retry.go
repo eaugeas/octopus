@@ -11,6 +11,10 @@ const (
 	defaultBaseExp         uint8         = 4
 	defaultMaxRetryTimeout time.Duration = 10 * time.Second
 	defaultAttempts        uint8         = 5
+
+	// minRetryTimeout is the lower bound for the delay between two
+	// attempts, so that a zero BaseTimeout does not cause a busy loop
+	minRetryTimeout time.Duration = time.Millisecond
 )
 
 // RandomOpts is the default configuration for a Retry
@@ -49,6 +53,7 @@ type RetryOpts struct {
 
 	// MaxRetryTimeout sets an upper bound into the time that
 	// the retry will wait until attempting an operation again.
+	// If it is not set (zero or negative) a default of 10s is used.
 	MaxRetryTimeout time.Duration
 }
 
@@ -56,18 +61,28 @@ type RetryOpts struct {
 // retry operation for a supplier. It keeps retrying the operation
 // until the maximum number of attempts has been reached, in which
 // case it returns the associated error, or until it succeeds.
+//
+// The first retry waits BaseTimeout, and every following retry waits
+// BaseExp times longer than the previous one, never exceeding
+// MaxRetryTimeout. When Random is set, each wait is a random duration
+// in (0, delay] where delay is the capped exponential value (full jitter).
+// If the context is done before the operation succeeds, ctx.Err() is
+// returned.
 func RetryWithOpts(
 	ctx context.Context,
 	supplier Supplier,
 	opts RetryOpts,
 ) (interface{}, error) {
 	var errs []error
-	timeout := opts.BaseTimeout.Nanoseconds()
-	exp := int64(opts.BaseExp)
-	maxTimeout := opts.MaxRetryTimeout.Nanoseconds()
+	maxTimeout := opts.MaxRetryTimeout
+	if maxTimeout <= 0 {
+		maxTimeout = defaultMaxRetryTimeout
+	}
+	var delay time.Duration
 	attempts := 0
 	maxAttempts := int(opts.Attempts)
 	timer := time.NewTimer(0 * time.Second)
+	defer timer.Stop()
 
 	if opts.UnlimitedAttempts {
 		maxAttempts = -1
@@ -76,8 +91,7 @@ func RetryWithOpts(
 	for {
 		select {
 		case <-ctx.Done():
-			timer.Stop()
-			return nil, context.Canceled
+			return nil, ctx.Err()
 
 		case <-timer.C:
 			v, err := supplier.Supply()
@@ -97,13 +111,52 @@ func RetryWithOpts(
 			return nil, ErrMaxAttemptsReached{Causes: errs}
 		}
 
-		// make sure that the timeout is set to at least 1ns
-		timeout = ((timeout * exp) % maxTimeout) + time.Millisecond.Nanoseconds()
-		if opts.Random {
-			timeout = int64(rand.Float64()*float64(timeout)) + 1
+		if attempts == 1 {
+			delay = firstRetryDelay(opts.BaseTimeout, maxTimeout)
+		} else {
+			delay = nextRetryDelay(delay, int64(opts.BaseExp), maxTimeout)
 		}
-		timer.Reset(time.Duration(timeout))
+
+		wait := delay
+		if opts.Random {
+			wait = time.Duration(rand.Float64()*float64(delay)) + 1
+		}
+		timer.Reset(wait)
 	}
+}
+
+// firstRetryDelay returns the delay to wait after the first failed
+// attempt. It is at least minRetryTimeout and at most maxTimeout
+func firstRetryDelay(base, maxTimeout time.Duration) time.Duration {
+	if base < minRetryTimeout {
+		base = minRetryTimeout
+	}
+
+	if base > maxTimeout {
+		return maxTimeout
+	}
+
+	return base
+}
+
+// nextRetryDelay computes the next exponential backoff delay from
+// the current one as min(current*exp, maxTimeout). Exponents lower
+// than 1 are treated as 1 so that the delay never decreases, and the
+// multiplication is guarded against overflow.
+func nextRetryDelay(current time.Duration, exp int64, maxTimeout time.Duration) time.Duration {
+	if exp < 1 {
+		exp = 1
+	}
+
+	if current < minRetryTimeout {
+		current = minRetryTimeout
+	}
+
+	if current >= maxTimeout || current > maxTimeout/time.Duration(exp) {
+		return maxTimeout
+	}
+
+	return current * time.Duration(exp)
 }
 
 // Retry is the same operation as RetryWithOpts but in this

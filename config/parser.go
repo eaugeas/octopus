@@ -24,12 +24,24 @@ type Parser struct {
 	v   *viper.Viper
 }
 
+// Parse parses the command line arguments of the process (os.Args)
+// and configures all the binders. See ParseArgs
 func (p *Parser) Parse() error {
+	return p.ParseArgs(os.Args)
+}
+
+// ParseArgs parses the provided arguments and then calls Configure
+// on the configuration file binder followed by all the binders of
+// the Config, in order. Values are resolved by viper, so a flag
+// takes precedence over an environment variable, which takes
+// precedence over the configuration file. It can only be called once,
+// otherwise ErrAlreadyParsed is returned
+func (p *Parser) ParseArgs(args []string) error {
 	if p.cmd.PersistentFlags().Parsed() {
 		return ErrAlreadyParsed
 	}
 
-	if err := p.cmd.PersistentFlags().Parse(os.Args); err != nil {
+	if err := p.cmd.PersistentFlags().Parse(args); err != nil {
 		return ErrParseFlags{err}
 	}
 
